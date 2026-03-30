@@ -125,7 +125,7 @@ def get_reply_keyboard(user_id: int) -> ReplyKeyboardMarkup:
             [KeyboardButton("💰 Баланс"),      KeyboardButton("📊 Отчёты")],
             [KeyboardButton("📥 Отчёт Excel"), KeyboardButton("❓ Помощь")],
         ]
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True, persistent=True)
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 
 # ─────────────────────────────────────────────
