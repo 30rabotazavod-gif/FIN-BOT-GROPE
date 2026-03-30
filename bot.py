@@ -2,12 +2,13 @@ import logging
 import re
 import os
 from datetime import datetime, date, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application,
     MessageHandler,
     CommandHandler,
     CallbackQueryHandler,
+    ConversationHandler,
     filters,
     ContextTypes,
 )
@@ -43,6 +44,11 @@ if ALLOWED_USERS_RAW.strip():
     ALLOWED_USERS = {int(uid.strip()) for uid in ALLOWED_USERS_RAW.split(",") if uid.strip()}
 ALLOWED_USERS.add(ADMIN_ID)
 
+# ConversationHandler states
+WAITING_DELETE_ID   = 1
+WAITING_EDIT_ID     = 2
+WAITING_EDIT_TEXT   = 3
+WAITING_SETSTART    = 4
 
 # ─────────────────────────────────────────────
 # HELPERS
@@ -79,12 +85,10 @@ def parse_transaction(text: str):
 
     currency = "USD" if "$" in text else "UZS"
     rest = text[match.end():].replace("$", "").strip()
-
     return {"type": t_type, "amount": amount, "currency": currency, "comment": rest}
 
 
-def parse_date(s: str) -> str | None:
-    """Принимает DD.MM.YYYY или DD.MM.YY, возвращает YYYY-MM-DD или None."""
+def parse_date(s: str):
     for fmt_str in ("%d.%m.%Y", "%d.%m.%y"):
         try:
             return datetime.strptime(s.strip(), fmt_str).strftime("%Y-%m-%d")
@@ -99,6 +103,116 @@ def is_admin(user_id: int) -> bool:
 
 def is_allowed(user_id: int) -> bool:
     return user_id in ALLOWED_USERS
+
+
+# ─────────────────────────────────────────────
+# КЛАВИАТУРЫ
+# ─────────────────────────────────────────────
+def main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Главное меню — для всех разрешённых пользователей."""
+    rows = [
+        [
+            InlineKeyboardButton("💰 Баланс",        callback_data="menu:balance"),
+            InlineKeyboardButton("📊 Отчёты",        callback_data="menu:reports"),
+        ],
+    ]
+    if is_admin(user_id):
+        rows.append([
+            InlineKeyboardButton("🔧 Управление",    callback_data="menu:admin"),
+            InlineKeyboardButton("📅 Дата начала",   callback_data="menu:setstart"),
+        ])
+    rows.append([
+        InlineKeyboardButton("❓ Помощь",            callback_data="menu:help"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def reports_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📅 Сегодня",       callback_data="report:today"),
+            InlineKeyboardButton("📆 Неделя",        callback_data="report:week"),
+        ],
+        [
+            InlineKeyboardButton("🗓 Месяц",         callback_data="report:month"),
+            InlineKeyboardButton("✏️ Период...",     callback_data="report:custom"),
+        ],
+        [InlineKeyboardButton("◀️ Назад",            callback_data="menu:main")],
+    ])
+
+
+def admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🗑 Удалить запись", callback_data="admin:delete"),
+            InlineKeyboardButton("✏️ Изменить коммент", callback_data="admin:edit"),
+        ],
+        [
+            InlineKeyboardButton("🕐 Последние 10",  callback_data="admin:recent"),
+        ],
+        [InlineKeyboardButton("◀️ Назад",            callback_data="menu:main")],
+    ])
+
+
+def back_keyboard(target="menu:main") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад в меню", callback_data=target)]])
+
+
+# ─────────────────────────────────────────────
+# ТЕКСТЫ
+# ─────────────────────────────────────────────
+async def send_balance_text(bot, chat_id):
+    bal    = get_balance()
+    recent = get_recent_transactions(5)
+    uzs    = bal.get("UZS", 0)
+    usd    = bal.get("USD", 0)
+    start  = get_start_date()
+
+    start_line = f"\n📅 Учёт с: <b>{start}</b>" if start else ""
+    lines = [
+        f"💰 <b>Текущий баланс</b>{start_line}",
+        "",
+        f"💵 <b>USD:</b>  {'📈' if usd >= 0 else '📉'} {fmt(usd, 'USD')}",
+        f"💳 <b>UZS:</b>  {'📈' if uzs >= 0 else '📉'} {fmt(uzs, 'UZS')}",
+    ]
+    if recent:
+        lines += ["", "─────────────────", "🕐 <b>Последние 5 операций:</b>"]
+        for r in recent:
+            sign = "+" if r["amount"] > 0 else ""
+            lines.append(
+                f"  <b>#{r['id']}</b> {sign}{fmt(r['amount'], r['currency'])}"
+                f" | {r['username']} | {r['comment'] or '—'}"
+            )
+    return "\n".join(lines)
+
+
+def build_report_text(from_date, to_date, label):
+    r = get_report(from_date, to_date)
+
+    def sign_icon(val):
+        return "📈" if val >= 0 else "📉"
+
+    text = (
+        f"📊 <b>Отчёт: {label}</b>\n"
+        f"📅 {from_date} → {to_date}\n"
+        f"📝 Записей: {r['count']}\n\n"
+        f"━━━━━━  💵 USD  ━━━━━━\n"
+        f"📥 Доход:   +{fmt(r['income_usd'],  'USD')}\n"
+        f"📤 Расход:  -{fmt(r['expense_usd'], 'USD')}\n"
+        f"{sign_icon(r['balance_usd'])} Итого:   {'+' if r['balance_usd'] >= 0 else ''}{fmt(r['balance_usd'], 'USD')}\n\n"
+        f"━━━━━━  💳 UZS  ━━━━━━\n"
+        f"📥 Доход:   +{fmt(r['income_uzs'],  'UZS')}\n"
+        f"📤 Расход:  -{fmt(r['expense_uzs'], 'UZS')}\n"
+        f"{sign_icon(r['balance_uzs'])} Итого:   {'+' if r['balance_uzs'] >= 0 else ''}{fmt(r['balance_uzs'], 'UZS')}\n"
+    )
+    txs = r["transactions"][-10:]
+    if txs:
+        text += "\n─────────────────────\n<b>Записи периода:</b>\n"
+        for t in reversed(txs):
+            sign = "+" if t["amount"] > 0 else ""
+            dt   = t["created_at"][5:10]
+            text += f"  <b>#{t['id']}</b> {dt} {sign}{fmt(t['amount'], t['currency'])} | {t['comment'] or '—'}\n"
+    return text
 
 
 # ─────────────────────────────────────────────
@@ -130,8 +244,8 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
             )
         return
 
-    sign   = 1 if tx["type"] == "income" else -1
-    tx_id  = add_transaction(
+    sign  = 1 if tx["type"] == "income" else -1
+    tx_id = add_transaction(
         user_id=user.id,
         username=user_display,
         amount=sign * tx["amount"],
@@ -145,7 +259,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await context.bot.send_message(
             chat_id=ADMIN_ID,
             text=(
-                f"⏭ <b>Запись проигнорирована</b> (до даты начала учёта {start})\n"
+                f"⏭ <b>Запись проигнорирована</b> (до даты начала {start})\n"
                 f"👤 {user_display}: <code>{text}</code>"
             ),
             parse_mode="HTML",
@@ -155,9 +269,8 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     icon     = "📥" if tx["type"] == "income" else "📤"
     sign_str = "+" if tx["type"] == "income" else "-"
 
-    # Кнопка удаления для админа
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🗑 Удалить запись #{tx_id}", callback_data=f"del:{tx_id}")]
+        [InlineKeyboardButton(f"🗑 Удалить #{tx_id}", callback_data=f"del:{tx_id}")]
     ])
 
     await context.bot.send_message(
@@ -174,18 +287,36 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 # ─────────────────────────────────────────────
-# CALLBACK: удаление через кнопку
+# /start — главное меню
 # ─────────────────────────────────────────────
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if not is_admin(query.from_user.id):
-        await query.answer("⛔ Только для администратора.", show_alert=True)
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_allowed(user.id):
+        await update.message.reply_text("⛔ У вас нет доступа.")
         return
 
-    data = query.data
+    greeting = "👋 Привет, <b>Администратор</b>!" if is_admin(user.id) else f"👋 Привет, <b>{user.first_name}</b>!"
+    await update.message.reply_text(
+        f"{greeting}\n\nВыберите действие:",
+        parse_mode="HTML",
+        reply_markup=main_menu_keyboard(user.id),
+    )
+
+
+# ─────────────────────────────────────────────
+# ГЛАВНЫЙ ОБРАБОТЧИК КНОПОК
+# ─────────────────────────────────────────────
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query   = update.callback_query
+    user_id = query.from_user.id
+    data    = query.data
+    await query.answer()
+
+    # ── Быстрое удаление из уведомления ──
     if data.startswith("del:"):
+        if not is_admin(user_id):
+            await query.answer("⛔ Только администратор.", show_alert=True)
+            return
         tx_id = int(data.split(":")[1])
         tx    = get_transaction_by_id(tx_id)
         if not tx:
@@ -198,276 +329,346 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{sign}{fmt(tx['amount'], tx['currency'])} | {tx['comment'] or '—'}",
             parse_mode="HTML",
         )
-
-
-# ─────────────────────────────────────────────
-# /balance — текущий баланс
-# ─────────────────────────────────────────────
-async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update.effective_user.id):
-        await update.message.reply_text("⛔ У вас нет доступа.")
         return
 
-    bal    = get_balance()
-    recent = get_recent_transactions(5)
-    uzs    = bal.get("UZS", 0)
-    usd    = bal.get("USD", 0)
-
-    start = get_start_date()
-    start_line = f"\n📅 Учёт с: <b>{start}</b>" if start else ""
-
-    lines = [
-        f"💰 <b>Текущий баланс</b>{start_line}",
-        "",
-        f"💵 <b>USD:</b>  {'📈' if usd >= 0 else '📉'} {fmt(usd, 'USD')}",
-        f"💳 <b>UZS:</b>  {'📈' if uzs >= 0 else '📉'} {fmt(uzs, 'UZS')}",
-    ]
-
-    if recent:
-        lines += ["", "─────────────────", "🕐 <b>Последние 5 операций:</b>"]
-        for r in recent:
-            sign = "+" if r["amount"] > 0 else ""
-            lines.append(
-                f"  <b>#{r['id']}</b> {sign}{fmt(r['amount'], r['currency'])}"
-                f" | {r['username']} | {r['comment'] or '—'}"
-            )
-
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
-
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await balance_command(update, context)
-
-
-# ─────────────────────────────────────────────
-# /report — отчёт за период
-# ─────────────────────────────────────────────
-async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update.effective_user.id):
-        await update.message.reply_text("⛔ У вас нет доступа.")
-        return
-
-    today = date.today()
-    args  = context.args  # список слов после команды
-
-    # Определяем период
-    if not args:
-        # По умолчанию — текущий месяц
-        from_date = today.strftime("%Y-%m-01")
-        to_date   = today.strftime("%Y-%m-%d")
-        label     = f"Месяц ({today.strftime('%m.%Y')})"
-
-    elif args[0].lower() == "сегодня":
-        from_date = to_date = today.strftime("%Y-%m-%d")
-        label = f"Сегодня ({today.strftime('%d.%m.%Y')})"
-
-    elif args[0].lower() == "неделя":
-        from_date = (today - timedelta(days=today.weekday())).strftime("%Y-%m-%d")
-        to_date   = today.strftime("%Y-%m-%d")
-        label     = "Текущая неделя"
-
-    elif args[0].lower() == "месяц":
-        from_date = today.strftime("%Y-%m-01")
-        to_date   = today.strftime("%Y-%m-%d")
-        label     = f"Текущий месяц ({today.strftime('%m.%Y')})"
-
-    elif "-" in args[0]:
-        # Формат: 01.06-30.06 или 01.06.2025-30.06.2025
-        parts = args[0].split("-")
-        if len(parts) == 2:
-            # Добавляем год если не указан
-            def normalize(d):
-                if d.count(".") == 1:
-                    d += f".{today.year}"
-                return d
-            fd = parse_date(normalize(parts[0]))
-            td = parse_date(normalize(parts[1]))
-            if fd and td:
-                from_date = fd
-                to_date   = td
-                label     = f"{parts[0]} — {parts[1]}"
-            else:
-                await update.message.reply_text(
-                    "❌ Неверный формат даты.\nПример: /report 01.06-30.06"
-                )
-                return
-        else:
-            await update.message.reply_text("❌ Неверный формат. Пример: /report 01.06-30.06")
+    # ── Навигация меню ──
+    if data == "menu:main":
+        if not is_allowed(user_id):
             return
-    else:
-        await update.message.reply_text(
-            "📊 Форматы команды /report:\n"
-            "  /report — текущий месяц\n"
-            "  /report сегодня\n"
-            "  /report неделя\n"
-            "  /report месяц\n"
-            "  /report 01.06-30.06"
+        await query.edit_message_text(
+            "Выберите действие:",
+            reply_markup=main_menu_keyboard(user_id),
         )
         return
 
-    r = get_report(from_date, to_date)
-
-    def sign_icon(val):
-        return "📈" if val >= 0 else "📉"
-
-    text = (
-        f"📊 <b>Отчёт: {label}</b>\n"
-        f"📅 {from_date} → {to_date}\n"
-        f"📝 Записей: {r['count']}\n"
-        f"\n"
-        f"━━━━━━  💵 USD  ━━━━━━\n"
-        f"📥 Доход:   +{fmt(r['income_usd'],  'USD')}\n"
-        f"📤 Расход:  -{fmt(r['expense_usd'], 'USD')}\n"
-        f"{sign_icon(r['balance_usd'])} Итого:   {'+' if r['balance_usd'] >= 0 else ''}{fmt(r['balance_usd'], 'USD')}\n"
-        f"\n"
-        f"━━━━━━  💳 UZS  ━━━━━━\n"
-        f"📥 Доход:   +{fmt(r['income_uzs'],  'UZS')}\n"
-        f"📤 Расход:  -{fmt(r['expense_uzs'], 'UZS')}\n"
-        f"{sign_icon(r['balance_uzs'])} Итого:   {'+' if r['balance_uzs'] >= 0 else ''}{fmt(r['balance_uzs'], 'UZS')}\n"
-    )
-
-    # Детали транзакций (максимум 15)
-    txs = r["transactions"][-15:]
-    if txs:
-        text += "\n─────────────────────\n<b>Последние записи:</b>\n"
-        for t in reversed(txs):
-            sign = "+" if t["amount"] > 0 else ""
-            dt   = t["created_at"][5:10]  # MM-DD
-            text += f"  <b>#{t['id']}</b> {dt} {sign}{fmt(t['amount'], t['currency'])} | {t['comment'] or '—'}\n"
-
-    await update.message.reply_text(text, parse_mode="HTML")
-
-
-# ─────────────────────────────────────────────
-# /delete <id> — удаление записи (только админ)
-# ─────────────────────────────────────────────
-async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Только для администратора.")
+    if data == "menu:balance":
+        if not is_allowed(user_id):
+            return
+        text = await send_balance_text(query.bot, query.message.chat_id)
+        await query.edit_message_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=back_keyboard("menu:main"),
+        )
         return
 
-    if not context.args:
-        await update.message.reply_text("❌ Укажите ID: /delete 42")
+    if data == "menu:reports":
+        if not is_allowed(user_id):
+            return
+        await query.edit_message_text(
+            "📊 <b>Выберите период отчёта:</b>",
+            parse_mode="HTML",
+            reply_markup=reports_keyboard(),
+        )
         return
 
-    try:
-        tx_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("❌ ID должен быть числом.")
+    if data == "menu:admin":
+        if not is_admin(user_id):
+            return
+        recent = get_recent_transactions(3)
+        lines  = ["🔧 <b>Панель администратора</b>\n"]
+        if recent:
+            lines.append("🕐 <b>Последние записи:</b>")
+            for r in recent:
+                sign = "+" if r["amount"] > 0 else ""
+                lines.append(f"  <b>#{r['id']}</b> {sign}{fmt(r['amount'], r['currency'])} | {r['comment'] or '—'}")
+        await query.edit_message_text(
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=admin_keyboard(),
+        )
         return
 
-    tx = get_transaction_by_id(tx_id)
-    if not tx:
-        await update.message.reply_text(f"❌ Запись #{tx_id} не найдена.")
+    if data == "menu:help":
+        if not is_allowed(user_id):
+            return
+        text = (
+            "📋 <b>Справка по боту</b>\n\n"
+            "<b>Запись в группе:</b>\n"
+            "  <code>+600$ коммент</code>  → доход USD\n"
+            "  <code>+500000 коммент</code> → доход UZS\n"
+            "  <code>-150000 аренда</code>  → расход UZS\n"
+            "  <code>50000</code>           → расход UZS\n\n"
+            "<b>Команды в ЛС:</b>\n"
+            "  /start — открыть меню\n"
+        )
+        if is_admin(user_id):
+            text += (
+                "\n<b>Удаление:</b> кнопка под уведомлением или 🔧 Управление\n"
+                "<b>Редактирование комментария:</b> 🔧 Управление → ✏️\n"
+                "<b>Дата начала учёта:</b> кнопка 📅 в меню\n"
+            )
+        await query.edit_message_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=back_keyboard("menu:main"),
+        )
         return
 
-    delete_transaction(tx_id)
-    sign = "+" if tx["amount"] > 0 else ""
-    await update.message.reply_text(
-        f"🗑 <b>Запись #{tx_id} удалена</b>\n"
-        f"{sign}{fmt(tx['amount'], tx['currency'])} | {tx['comment'] or '—'}",
-        parse_mode="HTML",
-    )
+    # ── Отчёты ──
+    if data.startswith("report:"):
+        if not is_allowed(user_id):
+            return
+        today = date.today()
+        period = data.split(":")[1]
 
+        if period == "today":
+            fd = td = today.strftime("%Y-%m-%d")
+            label = f"Сегодня ({today.strftime('%d.%m.%Y')})"
+        elif period == "week":
+            fd    = (today - timedelta(days=today.weekday())).strftime("%Y-%m-%d")
+            td    = today.strftime("%Y-%m-%d")
+            label = "Текущая неделя"
+        elif period == "month":
+            fd    = today.strftime("%Y-%m-01")
+            td    = today.strftime("%Y-%m-%d")
+            label = f"Текущий месяц ({today.strftime('%m.%Y')})"
+        elif period == "custom":
+            context.user_data["awaiting"] = "custom_report"
+            await query.edit_message_text(
+                "✏️ <b>Введите период</b> в формате:\n\n"
+                "<code>01.06-30.06</code>\n"
+                "или\n"
+                "<code>01.06.2025-30.06.2025</code>\n\n"
+                "Или нажмите /start для отмены.",
+                parse_mode="HTML",
+            )
+            return
+        else:
+            return
 
-# ─────────────────────────────────────────────
-# /edit <id> <новый комментарий> — правка (только админ)
-# ─────────────────────────────────────────────
-async def edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Только для администратора.")
+        text = build_report_text(fd, td, label)
+        await query.edit_message_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ К отчётам", callback_data="menu:reports")],
+                [InlineKeyboardButton("🏠 Главное меню", callback_data="menu:main")],
+            ]),
+        )
         return
 
-    if len(context.args) < 2:
-        await update.message.reply_text("❌ Формат: /edit 42 новый комментарий")
+    # ── Панель администратора ──
+    if data == "admin:recent":
+        if not is_admin(user_id):
+            return
+        recent = get_recent_transactions(10)
+        lines  = ["🕐 <b>Последние 10 записей:</b>\n"]
+        for r in recent:
+            sign = "+" if r["amount"] > 0 else ""
+            dt   = r["created_at"][5:10]
+            lines.append(
+                f"<b>#{r['id']}</b> {dt}  {sign}{fmt(r['amount'], r['currency'])}"
+                f"  | {r['username']}  | {r['comment'] or '—'}"
+            )
+        await query.edit_message_text(
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ Назад", callback_data="menu:admin")],
+            ]),
+        )
         return
 
-    try:
-        tx_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("❌ ID должен быть числом.")
-        return
-
-    new_comment = " ".join(context.args[1:])
-    tx = get_transaction_by_id(tx_id)
-    if not tx:
-        await update.message.reply_text(f"❌ Запись #{tx_id} не найдена.")
-        return
-
-    edit_transaction_comment(tx_id, new_comment)
-    await update.message.reply_text(
-        f"✏️ <b>Запись #{tx_id} обновлена</b>\n"
-        f"Старый комментарий: {tx['comment'] or '—'}\n"
-        f"Новый комментарий: {new_comment}",
-        parse_mode="HTML",
-    )
-
-
-# ─────────────────────────────────────────────
-# /setstart <дата> — установить дату начала учёта (только админ)
-# ─────────────────────────────────────────────
-async def setstart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Только для администратора.")
-        return
-
-    if not context.args:
-        current = get_start_date()
-        await update.message.reply_text(
-            f"📅 Текущая дата начала учёта: <b>{current or 'не задана (учёт с начала)'}</b>\n\n"
-            f"Чтобы изменить: /setstart 01.07.2025\n"
-            f"Чтобы убрать ограничение: /setstart сброс",
+    if data == "admin:delete":
+        if not is_admin(user_id):
+            return
+        context.user_data["awaiting"] = "delete_id"
+        await query.edit_message_text(
+            "🗑 <b>Удаление записи</b>\n\n"
+            "Введите <b>ID записи</b> которую нужно удалить.\n"
+            "(ID виден в уведомлениях и в списке последних записей)\n\n"
+            "Или нажмите /start для отмены.",
             parse_mode="HTML",
         )
         return
 
-    arg = context.args[0]
-
-    if arg.lower() in ("сброс", "reset", "off"):
-        set_start_date("")
-        await update.message.reply_text("✅ Дата начала учёта сброшена. Теперь учитываются все записи.")
-        return
-
-    parsed = parse_date(arg)
-    if not parsed:
-        await update.message.reply_text("❌ Неверный формат. Пример: /setstart 01.07.2025")
-        return
-
-    set_start_date(parsed)
-    await update.message.reply_text(
-        f"✅ Дата начала учёта установлена: <b>{parsed}</b>\n"
-        f"Записи до этой даты будут игнорироваться.",
-        parse_mode="HTML",
-    )
-
-
-# ─────────────────────────────────────────────
-# /help
-# ─────────────────────────────────────────────
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update.effective_user.id):
-        return
-
-    admin_section = ""
-    if is_admin(update.effective_user.id):
-        admin_section = (
-            "\n\n🔧 <b>Команды администратора:</b>\n"
-            "/delete 42 — удалить запись #42\n"
-            "/edit 42 новый текст — изменить комментарий\n"
-            "/setstart 01.07.2025 — учитывать записи с этой даты\n"
-            "/setstart сброс — убрать ограничение по дате"
+    if data == "admin:edit":
+        if not is_admin(user_id):
+            return
+        context.user_data["awaiting"] = "edit_id"
+        await query.edit_message_text(
+            "✏️ <b>Редактирование комментария</b>\n\n"
+            "Введите <b>ID записи</b> которую нужно изменить.\n\n"
+            "Или нажмите /start для отмены.",
+            parse_mode="HTML",
         )
+        return
 
+    if data == "menu:setstart":
+        if not is_admin(user_id):
+            return
+        current = get_start_date()
+        current_str = f"<b>{current}</b>" if current else "<i>не задана (учитываются все записи)</i>"
+        context.user_data["awaiting"] = "setstart"
+        await query.edit_message_text(
+            f"📅 <b>Дата начала учёта</b>\n\n"
+            f"Текущая дата: {current_str}\n\n"
+            f"Введите новую дату в формате <code>01.07.2025</code>\n"
+            f"Или напишите <code>сброс</code> чтобы учитывать все записи.\n\n"
+            f"Или нажмите /start для отмены.",
+            parse_mode="HTML",
+        )
+        return
+
+
+# ─────────────────────────────────────────────
+# ОБРАБОТКА ТЕКСТА В ЛС (ответы на вопросы от кнопок)
+# ─────────────────────────────────────────────
+async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_allowed(user.id):
+        return
+
+    awaiting = context.user_data.get("awaiting")
+    text     = update.message.text.strip()
+
+    # ── Кастомный период отчёта ──
+    if awaiting == "custom_report":
+        context.user_data.pop("awaiting", None)
+        today = date.today()
+        if "-" not in text:
+            await update.message.reply_text(
+                "❌ Неверный формат. Пример: <code>01.06-30.06</code>",
+                parse_mode="HTML",
+                reply_markup=back_keyboard(),
+            )
+            return
+        parts = text.split("-")
+        def normalize(d):
+            if d.count(".") == 1:
+                d += f".{today.year}"
+            return d
+        fd = parse_date(normalize(parts[0]))
+        td = parse_date(normalize(parts[1]))
+        if not fd or not td:
+            await update.message.reply_text(
+                "❌ Неверный формат даты. Пример: <code>01.06-30.06</code>",
+                parse_mode="HTML",
+            )
+            return
+        report_text = build_report_text(fd, td, f"{parts[0]} — {parts[1]}")
+        await update.message.reply_text(
+            report_text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📊 Другой период", callback_data="menu:reports")],
+                [InlineKeyboardButton("🏠 Главное меню",  callback_data="menu:main")],
+            ]),
+        )
+        return
+
+    # ── Удаление: ввод ID ──
+    if awaiting == "delete_id":
+        context.user_data.pop("awaiting", None)
+        if not is_admin(user.id):
+            return
+        try:
+            tx_id = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ ID должен быть числом.", reply_markup=back_keyboard("menu:admin"))
+            return
+        tx = get_transaction_by_id(tx_id)
+        if not tx:
+            await update.message.reply_text(f"❌ Запись #{tx_id} не найдена.", reply_markup=back_keyboard("menu:admin"))
+            return
+
+        # Показываем запись с кнопкой подтверждения
+        sign = "+" if tx["amount"] > 0 else ""
+        await update.message.reply_text(
+            f"🗑 <b>Удалить эту запись?</b>\n\n"
+            f"<b>#{tx['id']}</b> | {sign}{fmt(tx['amount'], tx['currency'])}\n"
+            f"👤 {tx['username']}\n"
+            f"📝 {tx['comment'] or '—'}\n"
+            f"📅 {tx['created_at'][:10]}",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Да, удалить", callback_data=f"del:{tx_id}"),
+                    InlineKeyboardButton("❌ Отмена",      callback_data="menu:admin"),
+                ]
+            ]),
+        )
+        return
+
+    # ── Редактирование: ввод ID ──
+    if awaiting == "edit_id":
+        if not is_admin(user.id):
+            return
+        try:
+            tx_id = int(text)
+        except ValueError:
+            context.user_data.pop("awaiting", None)
+            await update.message.reply_text("❌ ID должен быть числом.", reply_markup=back_keyboard("menu:admin"))
+            return
+        tx = get_transaction_by_id(tx_id)
+        if not tx:
+            context.user_data.pop("awaiting", None)
+            await update.message.reply_text(f"❌ Запись #{tx_id} не найдена.", reply_markup=back_keyboard("menu:admin"))
+            return
+        context.user_data["awaiting"]  = "edit_text"
+        context.user_data["edit_tx_id"] = tx_id
+        sign = "+" if tx["amount"] > 0 else ""
+        await update.message.reply_text(
+            f"✏️ <b>Запись #{tx_id}</b>\n"
+            f"{sign}{fmt(tx['amount'], tx['currency'])} | Текущий коммент: <i>{tx['comment'] or '—'}</i>\n\n"
+            f"Введите <b>новый комментарий</b>:",
+            parse_mode="HTML",
+        )
+        return
+
+    # ── Редактирование: ввод нового комментария ──
+    if awaiting == "edit_text":
+        if not is_admin(user.id):
+            return
+        context.user_data.pop("awaiting", None)
+        tx_id = context.user_data.pop("edit_tx_id", None)
+        if not tx_id:
+            return
+        edit_transaction_comment(tx_id, text)
+        await update.message.reply_text(
+            f"✅ <b>Запись #{tx_id} обновлена</b>\n"
+            f"Новый комментарий: <i>{text}</i>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ Назад в управление", callback_data="menu:admin")],
+                [InlineKeyboardButton("🏠 Главное меню",        callback_data="menu:main")],
+            ]),
+        )
+        return
+
+    # ── Дата начала учёта ──
+    if awaiting == "setstart":
+        if not is_admin(user.id):
+            return
+        context.user_data.pop("awaiting", None)
+        if text.lower() in ("сброс", "reset", "off"):
+            set_start_date("")
+            await update.message.reply_text(
+                "✅ Дата начала сброшена. Учитываются все записи.",
+                reply_markup=back_keyboard(),
+            )
+            return
+        parsed = parse_date(text)
+        if not parsed:
+            await update.message.reply_text(
+                "❌ Неверный формат. Пример: <code>01.07.2025</code>",
+                parse_mode="HTML",
+            )
+            return
+        set_start_date(parsed)
+        await update.message.reply_text(
+            f"✅ <b>Дата начала учёта: {parsed}</b>\n"
+            f"Записи до этой даты игнорируются.",
+            parse_mode="HTML",
+            reply_markup=back_keyboard(),
+        )
+        return
+
+    # ── Ничего не ждём — показываем меню ──
     await update.message.reply_text(
-        "📋 <b>Команды бота:</b>\n\n"
-        "/start или /balance — текущий баланс\n"
-        "/report — отчёт за текущий месяц\n"
-        "/report сегодня — за сегодня\n"
-        "/report неделя — за текущую неделю\n"
-        "/report месяц — за текущий месяц\n"
-        "/report 01.06-30.06 — за произвольный период"
-        + admin_section,
-        parse_mode="HTML",
+        "Выберите действие:",
+        reply_markup=main_menu_keyboard(user.id),
     )
 
 
@@ -481,17 +682,12 @@ def main():
     private = filters.ChatType.PRIVATE
     groups  = filters.TEXT & filters.ChatType.GROUPS
 
-    app.add_handler(CommandHandler("start",    start_command,   filters=private))
-    app.add_handler(CommandHandler("balance",  balance_command, filters=private))
-    app.add_handler(CommandHandler("report",   report_command,  filters=private))
-    app.add_handler(CommandHandler("delete",   delete_command,  filters=private))
-    app.add_handler(CommandHandler("edit",     edit_command,    filters=private))
-    app.add_handler(CommandHandler("setstart", setstart_command, filters=private))
-    app.add_handler(CommandHandler("help",     help_command,    filters=private))
+    app.add_handler(CommandHandler("start",   start_command,      filters=private))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(private & filters.TEXT, handle_private_text))
     app.add_handler(MessageHandler(groups, handle_group_message))
 
-    logger.info("Bot started (v2).")
+    logger.info("Bot started (v3 — with buttons).")
     app.run_polling(drop_pending_updates=True)
 
 
