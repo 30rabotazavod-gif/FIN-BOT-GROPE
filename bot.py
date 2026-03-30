@@ -360,66 +360,72 @@ def build_report_text(from_date, to_date, label) -> str:
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
-    msg  = update.message
-    user = msg.from_user
-    text = msg.text.strip()
+    msg       = update.message
+    user      = msg.from_user
+    full_text = msg.text.strip()
 
     if msg.chat.id != ALLOWED_GROUP:
         return
 
-    tx = parse_transaction(text)
     user_display = f"@{user.username}" if user.username else user.full_name
 
-    if tx is None:
-        if not re.search(r"\d", text):
-            await context.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=(
-                    f"⚠️ <b>Некорректная запись</b>\n"
-                    f"👤 {user_display}\n"
-                    f"📝 <code>{text}</code>"
-                ),
-                parse_mode="HTML",
-            )
-        return
+    # Каждая строка — отдельная транзакция
+    lines  = [l.strip() for l in full_text.splitlines() if l.strip()]
+    saved  = []   # (tx_id, tx)
+    errors = []   # некорректные строки (без цифр)
 
-    sign  = 1 if tx["type"] == "income" else -1
-    tx_id = add_transaction(
-        user_id=user.id,
-        username=user_display,
-        amount=sign * tx["amount"],
-        currency=tx["currency"],
-        comment=tx["comment"],
-        raw_text=text,
-        msg_id=msg.message_id,
-    )
+    for line in lines:
+        tx = parse_transaction(line)
+        if tx is None:
+            if not re.search(r"\d", line):
+                errors.append(line)
+            continue
 
-    if tx_id == -1:
-        await context.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=(
-                f"⏭ <b>Игнорирована</b> (до даты начала {get_start_date()})\n"
-                f"👤 {user_display}: <code>{text}</code>"
-            ),
-            parse_mode="HTML",
+        sign  = 1 if tx["type"] == "income" else -1
+        tx_id = add_transaction(
+            user_id=user.id,
+            username=user_display,
+            amount=sign * tx["amount"],
+            currency=tx["currency"],
+            comment=tx["comment"],
+            raw_text=line,
+            msg_id=msg.message_id,
         )
+        if tx_id != -1:
+            saved.append((tx_id, tx))
+
+    if not saved and not errors:
         return
 
-    icon     = "📥" if tx["type"] == "income" else "📤"
-    sign_str = "+" if tx["type"] == "income" else "-"
+    # Одно уведомление на всё сообщение
+    out = []
+    if saved:
+        n = len(saved)
+        word = "запись" if n == 1 else ("записи" if n < 5 else "записей")
+        out.append(f"📋 <b>{n} {word} от</b> {user_display}:\n")
+        delete_buttons = []
+        for tx_id, tx in saved:
+            sign_str = "+" if tx["type"] == "income" else "-"
+            icon     = "📥" if tx["type"] == "income" else "📤"
+            out.append(
+                f"{icon} <b>#{tx_id}</b>  {sign_str}{fmt(tx['amount'], tx['currency'])}"
+                f"  |  {tx['comment'] or '—'}"
+            )
+            delete_buttons.append(InlineKeyboardButton(f"🗑 #{tx_id}", callback_data=f"del:{tx_id}"))
+        keyboard = InlineKeyboardMarkup([delete_buttons[i:i+3] for i in range(0, len(delete_buttons), 3)])
+    else:
+        keyboard = None
+
+    if errors:
+        out.append("\n⚠️ Некорректные строки:")
+        for e in errors:
+            out.append(f"  <code>{e}</code>")
 
     await context.bot.send_message(
         chat_id=ADMIN_ID,
-        text=(
-            f"{icon} <b>Запись #{tx_id} принята</b>\n"
-            f"👤 {user_display}\n"
-            f"💰 {sign_str}{fmt(tx['amount'], tx['currency'])}\n"
-            f"📝 {tx['comment'] or '—'}"
-        ),
+        text="\n".join(out),
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"🗑 Удалить #{tx_id}", callback_data=f"del:{tx_id}")]
-        ]),
+        reply_markup=keyboard,
     )
 
 
