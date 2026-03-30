@@ -118,7 +118,8 @@ def get_reply_keyboard(user_id: int) -> ReplyKeyboardMarkup:
         buttons = [
             [KeyboardButton("💰 Баланс"),      KeyboardButton("📊 Отчёты")],
             [KeyboardButton("📥 Отчёт Excel"), KeyboardButton("🔧 Управление")],
-            [KeyboardButton("📅 Дата начала"), KeyboardButton("❓ Помощь")],
+            [KeyboardButton("➕ Добавить"),     KeyboardButton("📅 Дата начала")],
+            [KeyboardButton("❓ Помощь")],
         ]
     else:
         buttons = [
@@ -146,6 +147,9 @@ def reports_inline_keyboard() -> InlineKeyboardMarkup:
 
 def admin_inline_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("➕ Добавить запись",   callback_data="admin:add"),
+        ],
         [
             InlineKeyboardButton("🗑 Удалить запись",    callback_data="admin:delete"),
             InlineKeyboardButton("✏️ Изм. коммент",      callback_data="admin:edit"),
@@ -597,6 +601,24 @@ async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
+    # ── ➕ Добавить запись (только админ) ──
+    if text == "➕ Добавить":
+        if not is_admin(user.id):
+            return
+        context.user_data["awaiting"] = "manual_add"
+        await update.message.reply_text(
+            "➕ <b>Добавление записи вручную</b>\n\n"
+            "Введите запись в том же формате что и в группе:\n\n"
+            "  <code>+600$ коммент</code>  → доход USD\n"
+            "  <code>+500000 коммент</code> → доход UZS\n"
+            "  <code>-150000 аренда</code>  → расход UZS\n\n"
+            "Можно несколько строк сразу:\n"
+            "  <code>-56000 gaz\n-32000 otopark\n-160000 doktor</code>\n\n"
+            "Или нажмите /start для отмены.",
+            parse_mode="HTML",
+        )
+        return
+
     # ── 📅 Дата начала (только админ) ──
     if text == "📅 Дата начала":
         if not is_admin(user.id):
@@ -649,6 +671,57 @@ async def handle_awaiting_input(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     today = date.today()
+
+    # ── Ручное добавление записи (только админ) ──
+    if awaiting == "manual_add":
+        context.user_data.pop("awaiting", None)
+        if not is_admin(user.id):
+            return
+
+        lines  = [l.strip() for l in text.splitlines() if l.strip()]
+        saved  = []
+        failed = []
+
+        for line in lines:
+            tx = parse_transaction(line)
+            if tx is None:
+                failed.append(line)
+                continue
+            sign  = 1 if tx["type"] == "income" else -1
+            tx_id = add_transaction(
+                user_id=user.id,
+                username=f"@{user.username}" if user.username else user.full_name,
+                amount=sign * tx["amount"],
+                currency=tx["currency"],
+                comment=tx["comment"],
+                raw_text=line,
+                msg_id=None,
+            )
+            if tx_id != -1:
+                saved.append((tx_id, tx))
+            else:
+                failed.append(f"{line} (до даты начала учёта)")
+
+        out = []
+        if saved:
+            out.append(f"✅ <b>Добавлено {len(saved)} запис{'ь' if len(saved)==1 else 'и' if len(saved)<5 else 'ей'}:</b>\n")
+            del_btns = []
+            for tx_id, tx in saved:
+                s = "+" if tx["type"] == "income" else "-"
+                icon = "📥" if tx["type"] == "income" else "📤"
+                out.append(f"{icon} <b>#{tx_id}</b>  {s}{fmt(tx['amount'], tx['currency'])}  |  {tx['comment'] or '—'}")
+                del_btns.append(InlineKeyboardButton(f"🗑 #{tx_id}", callback_data=f"del:{tx_id}"))
+            keyboard = InlineKeyboardMarkup([del_btns[i:i+3] for i in range(0, len(del_btns), 3)])
+        else:
+            keyboard = None
+
+        if failed:
+            out.append(f"\n❌ <b>Не распознано:</b>")
+            for f in failed:
+                out.append(f"  <code>{f}</code>")
+
+        await update.message.reply_text("\n".join(out), parse_mode="HTML", reply_markup=keyboard)
+        return
 
     # ── Кастомный период (отчёт или Excel) ──
     if awaiting in ("custom_report", "custom_excel"):
@@ -908,6 +981,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"<b>#{r['id']}</b> {dt}  {sign}{fmt(r['amount'], r['currency'])}  | {r['username']}  | {r['comment'] or '—'}")
         await query.edit_message_text("\n".join(lines), parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="admin:back")]]))
+        return
+
+    if data == "admin:add":
+        if not is_admin(user_id): return
+        context.user_data["awaiting"] = "manual_add"
+        await query.edit_message_text(
+            "➕ <b>Добавление записи вручную</b>\n\n"
+            "Введите в том же формате что и в группе.\n"
+            "Можно несколько строк сразу:\n\n"
+            "<code>-56000 gaz\n-32000 otopark\n+1000000 оплата</code>\n\n"
+            "Или нажмите /start для отмены.",
+            parse_mode="HTML",
+        )
         return
 
     if data == "admin:back":
