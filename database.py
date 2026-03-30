@@ -1,11 +1,6 @@
-"""
-SQLite база данных для Тихого Финансового Контролёра.
-Путь к БД берётся из переменной окружения DB_PATH (по умолчанию /data/finance.db).
-"""
-
 import sqlite3
 import os
-from datetime import datetime, date
+from datetime import datetime
 
 DB_PATH = os.environ.get("DB_PATH", "/data/finance.db")
 
@@ -28,10 +23,16 @@ def init_db():
                 amount     INTEGER NOT NULL,
                 currency   TEXT    NOT NULL,
                 comment    TEXT,
-                raw_text   TEXT
+                raw_text   TEXT,
+                msg_id     INTEGER
             )
         """)
-        # Таблица настроек (например, дата начала учёта)
+        # Добавляем msg_id колонку если таблица уже существовала без неё
+        try:
+            conn.execute("ALTER TABLE transactions ADD COLUMN msg_id INTEGER")
+        except Exception:
+            pass
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key   TEXT PRIMARY KEY,
@@ -41,114 +42,102 @@ def init_db():
         conn.commit()
 
 
-# ─────────────────────────────────────────────
-# НАСТРОЙКИ
-# ─────────────────────────────────────────────
+# ─── НАСТРОЙКИ ───────────────────────────────
 
-def get_setting(key: str, default=None):
+def get_setting(key, default=None):
     with _get_conn() as conn:
-        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
     return row["value"] if row else default
 
 
-def set_setting(key: str, value: str):
+def set_setting(key, value):
     with _get_conn() as conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-            (key, value)
-        )
+        conn.execute("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)", (key, value))
         conn.commit()
 
 
-def get_start_date() -> str | None:
-    """Возвращает дату начала учёта в формате 'YYYY-MM-DD' или None."""
-    return get_setting("start_date")
+def get_start_date():
+    return get_setting("start_date") or None
 
 
 def set_start_date(dt: str):
-    """dt — строка 'YYYY-MM-DD'."""
     set_setting("start_date", dt)
 
 
-# ─────────────────────────────────────────────
-# ТРАНЗАКЦИИ
-# ─────────────────────────────────────────────
+# ─── ТРАНЗАКЦИИ ──────────────────────────────
 
-def add_transaction(user_id, username, amount, currency, comment, raw_text) -> int:
-    """Возвращает ID новой записи."""
+def add_transaction(user_id, username, amount, currency, comment, raw_text, msg_id=None) -> int:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    # Проверяем дату начала учёта
     start = get_start_date()
     if start and now[:10] < start:
-        return -1  # Запись до даты начала — игнорируем
-
+        return -1
     with _get_conn() as conn:
         cur = conn.execute(
-            """
-            INSERT INTO transactions (created_at, user_id, username, amount, currency, comment, raw_text)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (now, user_id, username, amount, currency, comment, raw_text),
+            "INSERT INTO transactions (created_at,user_id,username,amount,currency,comment,raw_text,msg_id) VALUES (?,?,?,?,?,?,?,?)",
+            (now, user_id, username, amount, currency, comment, raw_text, msg_id),
         )
         conn.commit()
         return cur.lastrowid
 
 
-def delete_transaction(tx_id: int) -> bool:
+def update_transaction(tx_id, amount, currency, comment, raw_text):
+    """Обновляет запись после редактирования сообщения в группе."""
     with _get_conn() as conn:
-        cur = conn.execute("DELETE FROM transactions WHERE id = ?", (tx_id,))
-        conn.commit()
-        return cur.rowcount > 0
-
-
-def edit_transaction_comment(tx_id: int, new_comment: str) -> bool:
-    with _get_conn() as conn:
-        cur = conn.execute(
-            "UPDATE transactions SET comment = ? WHERE id = ?",
-            (new_comment, tx_id)
+        conn.execute(
+            "UPDATE transactions SET amount=?, currency=?, comment=?, raw_text=? WHERE id=?",
+            (amount, currency, comment, raw_text, tx_id),
         )
         conn.commit()
+
+
+def delete_transaction(tx_id) -> bool:
+    with _get_conn() as conn:
+        cur = conn.execute("DELETE FROM transactions WHERE id=?", (tx_id,))
+        conn.commit()
         return cur.rowcount > 0
 
 
-def get_transaction_by_id(tx_id: int):
+def edit_transaction_comment(tx_id, new_comment):
+    with _get_conn() as conn:
+        conn.execute("UPDATE transactions SET comment=? WHERE id=?", (new_comment, tx_id))
+        conn.commit()
+
+
+def get_transaction_by_id(tx_id):
+    with _get_conn() as conn:
+        row = conn.execute("SELECT * FROM transactions WHERE id=?", (tx_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_transaction_by_msg_id(msg_id):
+    """Найти запись по ID сообщения в группе (для отслеживания редактирования)."""
     with _get_conn() as conn:
         row = conn.execute(
-            "SELECT * FROM transactions WHERE id = ?", (tx_id,)
+            "SELECT * FROM transactions WHERE msg_id=? ORDER BY id DESC LIMIT 1", (msg_id,)
         ).fetchone()
     return dict(row) if row else None
 
 
-def get_balance(from_date: str = None, to_date: str = None) -> dict:
-    """
-    Возвращает {'UZS': int, 'USD': int}.
-    Учитывает глобальную start_date, если from_date не задан явно.
-    """
+def get_balance(from_date=None, to_date=None) -> dict:
     start = from_date or get_start_date()
-
     query = "SELECT currency, SUM(amount) as total FROM transactions"
     params = []
-    conditions = []
-
+    conds  = []
     if start:
-        conditions.append("created_at >= ?")
+        conds.append("created_at >= ?")
         params.append(start + " 00:00:00")
     if to_date:
-        conditions.append("created_at <= ?")
+        conds.append("created_at <= ?")
         params.append(to_date + " 23:59:59")
-
-    if conditions:
-        query += " WHERE " + " AND ".join(conditions)
+    if conds:
+        query += " WHERE " + " AND ".join(conds)
     query += " GROUP BY currency"
-
     with _get_conn() as conn:
         rows = conn.execute(query, params).fetchall()
+    return {r["currency"]: r["total"] or 0 for r in rows}
 
-    return {row["currency"]: row["total"] or 0 for row in rows}
 
-
-def get_recent_transactions(limit: int = 5, from_date: str = None) -> list:
+def get_recent_transactions(limit=5, from_date=None) -> list:
     start = from_date or get_start_date()
     query = "SELECT * FROM transactions"
     params = []
@@ -157,40 +146,43 @@ def get_recent_transactions(limit: int = 5, from_date: str = None) -> list:
         params.append(start + " 00:00:00")
     query += " ORDER BY id DESC LIMIT ?"
     params.append(limit)
-
     with _get_conn() as conn:
         rows = conn.execute(query, params).fetchall()
     return [dict(r) for r in rows]
 
 
-def get_report(from_date: str, to_date: str) -> dict:
-    """
-    Возвращает детальный отчёт за период.
-    {
-        'income_uzs': int, 'expense_uzs': int, 'balance_uzs': int,
-        'income_usd': int, 'expense_usd': int, 'balance_usd': int,
-        'count': int,
-        'transactions': [...]
-    }
-    """
+def get_all_transactions(from_date=None, to_date=None) -> list:
+    start = from_date or get_start_date()
+    query = "SELECT * FROM transactions"
+    params = []
+    conds  = []
+    if start:
+        conds.append("created_at >= ?")
+        params.append(start + " 00:00:00")
+    if to_date:
+        conds.append("created_at <= ?")
+        params.append(to_date + " 23:59:59")
+    if conds:
+        query += " WHERE " + " AND ".join(conds)
+    query += " ORDER BY created_at ASC"
+    with _get_conn() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_report(from_date, to_date) -> dict:
     with _get_conn() as conn:
         rows = conn.execute(
-            """
-            SELECT * FROM transactions
-            WHERE created_at >= ? AND created_at <= ?
-            ORDER BY created_at ASC
-            """,
+            "SELECT * FROM transactions WHERE created_at >= ? AND created_at <= ? ORDER BY created_at ASC",
             (from_date + " 00:00:00", to_date + " 23:59:59"),
         ).fetchall()
-
     txs = [dict(r) for r in rows]
 
     def calc(currency, positive):
         vals = [r["amount"] for r in txs if r["currency"] == currency]
         if positive:
             return sum(v for v in vals if v > 0)
-        else:
-            return abs(sum(v for v in vals if v < 0))
+        return abs(sum(v for v in vals if v < 0))
 
     return {
         "income_uzs":  calc("UZS", True),
@@ -199,6 +191,6 @@ def get_report(from_date: str, to_date: str) -> dict:
         "income_usd":  calc("USD", True),
         "expense_usd": calc("USD", False),
         "balance_usd": calc("USD", True) - calc("USD", False),
-        "count": len(txs),
+        "count":        len(txs),
         "transactions": txs,
     }
