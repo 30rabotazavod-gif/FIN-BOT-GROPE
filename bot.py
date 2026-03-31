@@ -135,12 +135,15 @@ def get_reply_keyboard(user_id: int) -> ReplyKeyboardMarkup:
 def reports_inline_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📅 Сегодня",   callback_data="report:today"),
-            InlineKeyboardButton("📆 Неделя",    callback_data="report:week"),
+            InlineKeyboardButton("📅 Сегодня",      callback_data="report:today"),
+            InlineKeyboardButton("📆 Неделя",       callback_data="report:week"),
         ],
         [
-            InlineKeyboardButton("🗓 Месяц",     callback_data="report:month"),
-            InlineKeyboardButton("✏️ Период...", callback_data="report:custom"),
+            InlineKeyboardButton("🗓 Месяц",        callback_data="report:month"),
+            InlineKeyboardButton("✏️ Период...",    callback_data="report:custom"),
+        ],
+        [
+            InlineKeyboardButton("📊 Всё время",    callback_data="report:alltime"),
         ],
     ])
 
@@ -579,6 +582,9 @@ async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
                     InlineKeyboardButton("🗓 Месяц",     callback_data="excel:month"),
                     InlineKeyboardButton("✏️ Период...", callback_data="excel:custom"),
                 ],
+                [
+                    InlineKeyboardButton("📊 Всё время", callback_data="excel:alltime"),
+                ],
             ]),
         )
         return
@@ -920,6 +926,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             fd    = today.strftime("%Y-%m-01")
             td    = today.strftime("%Y-%m-%d")
             label = f"Текущий месяц ({today.strftime('%m.%Y')})"
+        elif period == "alltime":
+            # От даты начала учёта (или самой первой записи) до сегодня
+            start = get_start_date()
+            if start:
+                fd    = start
+                label = f"Всё время (с {start})"
+            else:
+                # Берём дату самой первой записи в БД
+                from database import get_first_transaction_date
+                first = get_first_transaction_date()
+                fd    = first if first else today.strftime("%Y-%m-%d")
+                label = f"Всё время (с {fd})"
+            td = today.strftime("%Y-%m-%d")
         elif period == "custom":
             context.user_data["awaiting"] = "custom_report"
             await query.edit_message_text(
@@ -947,6 +966,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             fd    = today.strftime("%Y-%m-01")
             td    = today.strftime("%Y-%m-%d")
             label = f"Месяц {today.strftime('%m.%Y')}"
+        elif period == "alltime":
+            start = get_start_date()
+            if start:
+                fd    = start
+                label = f"Всё время (с {start})"
+            else:
+                from database import get_first_transaction_date
+                first = get_first_transaction_date()
+                fd    = first if first else today.strftime("%Y-%m-%d")
+                label = f"Всё время (с {fd})"
+            td = today.strftime("%Y-%m-%d")
         elif period == "custom":
             context.user_data["awaiting"] = "custom_excel"
             await query.edit_message_text(

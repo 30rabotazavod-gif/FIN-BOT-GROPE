@@ -170,7 +170,13 @@ def get_all_transactions(from_date=None, to_date=None) -> list:
     return [dict(r) for r in rows]
 
 
-def get_report(from_date, to_date) -> dict:
+def get_first_transaction_date() -> str | None:
+    """Возвращает дату самой первой записи в БД (YYYY-MM-DD) или None."""
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT created_at FROM transactions ORDER BY id ASC LIMIT 1"
+        ).fetchone()
+    return row["created_at"][:10] if row else None
     with _get_conn() as conn:
         rows = conn.execute(
             "SELECT * FROM transactions WHERE created_at >= ? AND created_at <= ? ORDER BY created_at ASC",
